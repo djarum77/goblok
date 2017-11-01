@@ -1,96 +1,177 @@
-<?php
-/*
-copyright @ medantechno.com
-Modified by Ilyasa
-And Modified by Farzain - zFz ( Faraaz )
-2017
-*/
-require_once('./line_class.php');
+package fam100
 
-$channelAccessToken = '881d40PWeMuqCAz04wmt7nRS8KMOvPwAZe3Zd7JzAFj/2g9S7eI6w8tqq6tjAOIUjQWu21srdzq7ZgU8Z1CgTQxIJUjOh+NOWw/sJj4CUzeyBJTsON0l6WMjnmKg0V26PYXyaV2AD5MPvZBkoEqjdgdB04t89/1O/w1cDnyilFU='; //Your Channel Access Token
-$channelSecret = 'e7bf92aefd3c086789cfe148fa9c1846';//Your Channel Secret
+import (
+	"bytes"
+	"encoding/gob"
+	"fmt"
+	"math/rand"
+	"strconv"
+	"strings"
 
-$client = new LINEBotTiny($channelAccessToken, $channelSecret);
+	"github.com/boltdb/bolt"
+)
 
-$userId 	= $client->parseEvents()[0]['source']['userId'];
-$replyToken = $client->parseEvents()[0]['replyToken'];
-$message 	= $client->parseEvents()[0]['message'];
-$profil = $client->profil($userId);
-$pesan_datang = $message['text'];
+// Database configuration
+var (
+	DefaultQuestionDB QuestionDB
+	QuestionBucket    = []byte("questions")
 
-if($message['type']=='sticker')
-{	
-	$balas = array(
-							'UserID' => $profil->userId,	
-                                                        'replyToken' => $replyToken,							
-							'messages' => array(
-								array(
-										'type' => 'text',									
-										'text' => 'Terima Kasih Stikernya.'										
-									
-									)
-							)
-						);
-						
+	// ExtraQuestionSeed seed the random for question
+	ExtraQuestionSeed = int64(0)
+)
+
+func InitQuestion(dbPath string) (numQuestion int, err error) {
+	if err := DefaultQuestionDB.Initialize(dbPath); err != nil {
+		return 0, err
+	}
+
+	questionSize := DefaultQuestionDB.questionSize
+	DefaultQuestionLimit = int(float64(questionSize) * 0.8)
+
+	return questionSize, nil
 }
-else
-$pesan=str_replace(" ", "%20", $pesan_datang);
-$key = 'f902a858-eee9-44d1-8e9d-738b7cfaaca1'; //API SimSimi
-$url = 'http://sandbox.api.simsimi.com/request.p?key='.$key.'&lc=id&ft=1.0&text='.$pesan;
-$json_data = file_get_contents($url);
-$url=json_decode($json_data,1);
-$diterima = $url['response'];
-if($message['type']=='text')
-{
-if($url['result'] == 404)
-	{
-		$balas = array(
-							'UserID' => $profil->userId,	
-                                                        'replyToken' => $replyToken,													
-							'messages' => array(
-								array(
-										'type' => 'text',					
-										'text' => 'Mohon Gunakan Bahasa Indonesia Yang Benar :D.'
-									)
-							)
-						);
-				
-	}
-else
-if($url['result'] != 100)
-	{
-		
-		
-		$balas = array(
-							'UserID' => $profil->userId,
-                                                        'replyToken' => $replyToken,														
-							'messages' => array(
-								array(
-										'type' => 'text',					
-										'text' => 'Maaf '.$profil->displayName.' Server Kami Sedang Sibuk Sekarang.'
-									)
-							)
-						);
-				
-	}
-	else{
-		$balas = array(
-							'UserID' => $profil->userId,
-                                                        'replyToken' => $replyToken,														
-							'messages' => array(
-								array(
-										'type' => 'text',					
-										'text' => ''.$diterima.''
-									)
-							)
-						);
-						
-	}
+
+type QuestionDB struct {
+	DB           *bolt.DB
+	questionSize int
 }
- 
-$result =  json_encode($balas);
 
-file_put_contents('./reply.json',$result);
+func (d *QuestionDB) Initialize(dbPath string) error {
+	var err error
+	d.DB, err = bolt.Open(dbPath, 0600, nil)
+	if err != nil {
+		return err
+	}
+	err = d.DB.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(QuestionBucket)
+		if err != nil {
+			return fmt.Errorf("create bucket: %s", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
 
+	err = d.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(QuestionBucket)
+		stats := b.Stats()
+		d.questionSize = stats.KeyN
+		return nil
+	})
+	if err != nil {
+		return err
+	}
 
-$client->replyMessage($balas);
+	if d.questionSize == 0 {
+		return fmt.Errorf("Loaded 0 questions")
+	}
+
+	return nil
+}
+
+func (d *QuestionDB) Close() error {
+	return d.DB.Close()
+}
+
+func (d *QuestionDB) AddQuestion(q Question) error {
+	var buff bytes.Buffer
+	enc := gob.NewEncoder(&buff)
+	if err := enc.Encode(q); err != nil {
+		return err
+	}
+
+	d.DB.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(QuestionBucket)
+		id := strconv.FormatInt(int64(q.ID), 10)
+		err := b.Put([]byte(id), buff.Bytes())
+		return err
+	})
+
+	return nil
+}
+
+func AddQuestion(q Question) error {
+	return DefaultQuestionDB.AddQuestion(q)
+}
+
+func (d *QuestionDB) GetQuestion(id string) (q Question, err error) {
+	err = d.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(QuestionBucket)
+		v := b.Get([]byte(id))
+
+		buff := bytes.NewBuffer(v)
+		dec := gob.NewDecoder(buff)
+		if err := dec.Decode(&q); err != nil {
+			return err
+		}
+
+		q.lookup = make(map[string]int)
+		for i, ans := range q.Answers {
+			for _, text := range ans.Text {
+				text = strings.TrimSpace(strings.ToLower(text))
+				q.lookup[text] = i
+			}
+		}
+
+		return nil
+	})
+	return q, err
+}
+func GetQuestion(id string) (q Question, err error) {
+	return DefaultQuestionDB.GetQuestion(id)
+}
+
+// NextQuestion generates next question randomly by taking into account
+// numbers of game played for particular seed key
+func NextQuestion(seed int64, played int, questionLimit int) (q Question, err error) {
+	questionSize := DefaultQuestionDB.questionSize
+	if questionLimit <= 0 || questionLimit > questionSize {
+		questionLimit = questionSize
+	}
+	r := rand.New(rand.NewSource(seed + ExtraQuestionSeed))
+	order := r.Perm(questionSize)
+	id := order[played%questionLimit] + 1 // order is 0 based
+	idStr := strconv.FormatInt(int64(id), 10)
+
+	return GetQuestion(idStr)
+}
+
+// Question for a round
+type Question struct {
+	ID      int
+	Text    string
+	Answers []Answer
+	lookup  map[string]int
+}
+
+// check answers gives the score for particular answer to a question
+func (q Question) checkAnswer(text string) (correct bool, score, index int) {
+	text = strings.TrimSpace(strings.ToLower(text))
+	if i, ok := q.lookup[text]; ok {
+		return true, q.Answers[i].Score, i
+	}
+
+	return false, 0, -1
+}
+
+type Answer struct {
+	ID    int
+	Text  []string
+	Score int
+}
+
+func (a Answer) String() string {
+	if len(a.Text) == 1 {
+		return a.Text[0]
+	}
+
+	var b bytes.Buffer
+	for i, text := range a.Text {
+		if i != 0 {
+			b.WriteString(" / ")
+		}
+		b.WriteString(text)
+	}
+	return b.String()
+}
